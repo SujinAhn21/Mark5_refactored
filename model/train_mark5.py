@@ -1,0 +1,368 @@
+import os
+import sys
+import csv
+import argparse
+import hashlib
+
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
+UTILS_DIR = os.path.join(PROJECT_ROOT, "utils")
+VILD_DIR = os.path.join(PROJECT_ROOT, "vild")
+RESOURCES_DIR = os.path.join(PROJECT_ROOT, "resources")
+for p in (PROJECT_ROOT, UTILS_DIR, VILD_DIR):
+    if p not in sys.path:
+        sys.path.append(p)
+
+from feature_cache import get_feature_cache_path, get_metadata_cache_path
+from vild_config import AudioViLDConfig
+from vild_model import ViLDTextHead, build_audio_encoder
+from vild_head import DualBranchStudentHead
+from vild_parser_teacher import AudioParser
+from teacher_fusion import WeightedTeacherFusion
+from seed_utils import set_seed
+SHARED_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, "..", "shared_vild"))
+if SHARED_DIR not in sys.path:
+    sys.path.append(SHARED_DIR)
+from checkpoint_utils import apply_config_metadata, load_checkpoint, resolve_state_dict, save_checkpoint
+
+
+def _resolve_csv_path(filename):
+    candidates = [
+        os.path.join(PROJECT_ROOT, filename),
+        os.path.join(BASE_DIR, filename),
+        os.path.join(PROJECT_ROOT, "preprocessing", filename),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(f"[ERROR] CSV 파일을 찾을 수 없습니다: {candidates}")
+
+
+def _resolve_resource_path(filename):
+    candidates = [
+        os.path.join(RESOURCES_DIR, filename),
+        os.path.join(PROJECT_ROOT, filename),
+        os.path.join(BASE_DIR, filename),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(f"[ERROR] 리소스 파일을 찾을 수 없습니다: {candidates}")
+
+
+class EnsembleTeacher:
+    def __init__(self, specialist_config, device):
+        self.device = device
+        self.specialists = {}
+        self.embedding_dim = None
+        for class_name, paths in specialist_config.items():
+            encoder_ckpt = load_checkpoint(_resolve_resource_path(paths["encoder_path"]), map_location=device)
+            config = AudioViLDConfig(mark_version=paths["mark_version"])
+            apply_config_metadata(config, encoder_ckpt)
+            encoder = build_audio_encoder(config).to(self.device)
+            encoder.load_state_dict(resolve_state_dict(encoder_ckpt, "model_state_dict", "encoder_state_dict", "model"))
+            encoder.eval()
+
+            classifier_ckpt = load_checkpoint(_resolve_resource_path(paths["classifier_path"]), map_location=device)
+            apply_config_metadata(config, classifier_ckpt)
+            classifier = ViLDTextHead(config).to(self.device)
+            classifier.load_state_dict(resolve_state_dict(classifier_ckpt, "classifier_state_dict", "head_state_dict", "head"))
+            classifier.eval()
+            if "text_embeddings" in classifier_ckpt:
+                text_emb = classifier_ckpt["text_embeddings"].to(device)
+            else:
+                text_emb = config.get_class_text_embeddings().to(device)
+            self.specialists[class_name] = {
+                "encoder": encoder,
+                "classifier": classifier,
+                "text_emb": text_emb,
+            }
+            if self.embedding_dim is None:
+                self.embedding_dim = config.embedding_dim
+
+    @torch.no_grad()
+    def __call__(self, unlabeled_audio_batch, student_class_map):
+        fusion_inputs = {}
+        for class_name, models in self.specialists.items():
+            region_emb = models["encoder"](unlabeled_audio_batch)
+            logits = models["classifier"](region_emb, models["text_emb"])
+            fusion_inputs[class_name] = {
+                "logits": logits,
+                "features": region_emb,
+            }
+        return WeightedTeacherFusion(student_class_map, self.embedding_dim, self.device).fuse(fusion_inputs)
+
+
+class SemiSupervisedDataset(Dataset):
+    def __init__(self, file_path_list, parser, config, is_labeled=True):
+        self.samples = []
+        self.parser = parser
+        self.config = config
+        self.is_labeled = is_labeled
+        valid_labels = set(config.get_classes_for_evaluation()) if is_labeled else None
+
+        for item in file_path_list:
+            path = item["path"]
+            label = item.get("label")
+            if is_labeled and label not in valid_labels:
+                continue
+            try:
+                segment_records = parser.load_and_segment_with_metadata(path)
+                for record in segment_records:
+                    seg = record["tensor"]
+                    if seg is not None:
+                        metadata = {
+                            "path": path,
+                            "label": label if is_labeled else "unlabeled",
+                            "segment_index": record["segment_index"],
+                            "start_frame": record["start_frame"],
+                            "end_frame": record["end_frame"],
+                            "saliency": record["saliency"],
+                        }
+                        self.samples.append((seg, label if is_labeled else -1, metadata))
+            except Exception as e:
+                print(f"[ERROR] Failed to parse {path}: {e}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+
+class SampleListDataset(Dataset):
+    def __init__(self, samples):
+        self.samples = samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+
+def custom_collate(batch):
+    mels, labels, metadata = zip(*batch)
+    return torch.stack(mels, dim=0), list(labels), list(metadata)
+
+
+class DistillationLoss(nn.Module):
+    def __init__(self, temperature, alpha, feature_kd_weight=0.0):
+        super().__init__()
+        self.temperature = temperature
+        self.alpha = alpha
+        self.feature_kd_weight = feature_kd_weight
+        self.hard = nn.CrossEntropyLoss()
+        self.soft = nn.KLDivLoss(reduction="batchmean")
+
+    def forward(self, student_logits, hard_targets=None, teacher_logits=None, student_features=None, teacher_features=None):
+        total = torch.tensor(0.0, device=student_logits.device)
+        hard_loss = torch.tensor(0.0, device=student_logits.device)
+        soft_loss = torch.tensor(0.0, device=student_logits.device)
+        feat_loss = torch.tensor(0.0, device=student_logits.device)
+
+        if hard_targets is not None and len(hard_targets) > 0:
+            hard_loss = self.hard(student_logits, hard_targets)
+            total = total + (1 - self.alpha) * hard_loss
+
+        if teacher_logits is not None and len(teacher_logits) > 0:
+            soft_loss = self.soft(
+                F.log_softmax(student_logits / self.temperature, dim=1),
+                F.softmax(teacher_logits / self.temperature, dim=1),
+            ) * (self.temperature ** 2)
+            total = total + self.alpha * soft_loss
+
+        if (
+            self.feature_kd_weight > 0
+            and student_features is not None
+            and teacher_features is not None
+            and len(teacher_features) > 0
+        ):
+            sf = F.normalize(student_features, dim=1)
+            tf = F.normalize(teacher_features, dim=1)
+            feat_loss = 0.5 * F.l1_loss(sf, tf) + 0.5 * (1 - F.cosine_similarity(sf, tf, dim=1).mean())
+            total = total + self.feature_kd_weight * feat_loss
+
+        return total, hard_loss, soft_loss, feat_loss
+
+
+def _stable_file_split(path, val_ratio=0.1):
+    key = os.path.basename(path).encode("utf-8")
+    digest = hashlib.md5(key).hexdigest()
+    bucket = int(digest[:8], 16) / 0xFFFFFFFF
+    return "val" if bucket < val_ratio else "train"
+
+
+def train_mark5(seed_value=42, mark_version="mark5.0"):
+    set_seed(seed_value)
+    config = AudioViLDConfig(mark_version=mark_version)
+    device = config.device
+    parser = AudioParser(config, segment_mode=True)
+
+    labeled_files = list(csv.DictReader(open(_resolve_csv_path("dataset_labeled.csv"), newline="", encoding="utf-8")))
+    unlabeled_files = list(csv.DictReader(open(_resolve_csv_path("dataset_unlabeled.csv"), newline="", encoding="utf-8")))
+
+    labeled_dataset = SemiSupervisedDataset(labeled_files, parser, config, is_labeled=True)
+    unlabeled_dataset = SemiSupervisedDataset(unlabeled_files, parser, config, is_labeled=False)
+
+    train_samples = []
+    val_samples = []
+    for sample in labeled_dataset.samples:
+        _, label, metadata = sample
+        split_name = _stable_file_split(metadata["path"], val_ratio=0.1)
+        if split_name == "val":
+            val_samples.append(sample)
+        else:
+            train_samples.append(sample)
+
+    train_dataset = SampleListDataset(train_samples)
+    val_dataset = SampleListDataset(val_samples)
+
+    final_train_dataset = ConcatDataset([train_dataset, unlabeled_dataset])
+
+    train_loader = DataLoader(final_train_dataset, batch_size=config.batch_size, shuffle=True, collate_fn=custom_collate)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, collate_fn=custom_collate)
+
+    student_encoder = build_audio_encoder(config).to(device)
+    student_branch = DualBranchStudentHead(config.embedding_dim).to(device)
+    student_classifier = ViLDTextHead(config).to(device)
+    student_text_emb = config.get_class_text_embeddings(for_evaluation=True).to(device)
+    student_label_map = config.get_target_label_map()
+
+    specialist_config = {
+        "heavy_impact": {"mark_version": "mark4.1", "encoder_path": "best_teacher_encoder_mark4.1.pth", "classifier_path": "best_teacher_classifier_mark4.1.pth"},
+        "dragging": {"mark_version": "mark4.2", "encoder_path": "best_teacher_encoder_mark4.2.pth", "classifier_path": "best_teacher_classifier_mark4.2.pth"},
+        "construction": {"mark_version": "mark4.3", "encoder_path": "best_teacher_encoder_mark4.3.pth", "classifier_path": "best_teacher_classifier_mark4.3.pth"},
+        "machine_noise": {"mark_version": "mark4.4", "encoder_path": "best_teacher_encoder_mark4.4.pth", "classifier_path": "best_teacher_classifier_mark4.4.pth"},
+        "media_talking": {"mark_version": "mark4.5", "encoder_path": "best_teacher_encoder_mark4.5.pth", "classifier_path": "best_teacher_classifier_mark4.5.pth"},
+        "water_toilet": {"mark_version": "mark4.6", "encoder_path": "best_teacher_encoder_mark4.6.pth", "classifier_path": "best_teacher_classifier_mark4.6.pth"},
+        "water_shower": {"mark_version": "mark4.7", "encoder_path": "best_teacher_encoder_mark4.7.pth", "classifier_path": "best_teacher_classifier_mark4.7.pth"},
+        "dog_bark": {"mark_version": "mark4.8", "encoder_path": "best_teacher_encoder_mark4.8.pth", "classifier_path": "best_teacher_classifier_mark4.8.pth"},
+    }
+    ensemble_teacher = EnsembleTeacher(specialist_config, device)
+    teacher_feature_cache = []
+    unlabeled_metadata_cache = []
+
+    criterion = DistillationLoss(temperature=4.0, alpha=0.7, feature_kd_weight=config.feature_kd_weight if config.use_feature_kd else 0.0)
+    optimizer = optim.Adam(list(student_encoder.parameters()) + list(student_branch.parameters()), lr=config.learning_rate)
+
+    train_hist, val_hist = [], []
+    print(f"[INFO] Student training ({mark_version}) started on {device}")
+    for epoch in range(config.num_epochs):
+        student_encoder.train()
+        student_branch.train()
+        total_loss = total_hard_loss = total_soft_loss = total_feat_loss = 0.0
+
+        for mel_batch, label_batch, metadata_batch in train_loader:
+            mel = mel_batch.to(device)
+            optimizer.zero_grad()
+
+            labeled_indices = [i for i, lbl in enumerate(label_batch) if isinstance(lbl, str)]
+            unlabeled_indices = [i for i, lbl in enumerate(label_batch) if lbl == -1]
+            loss = torch.tensor(0.0, device=device)
+
+            if labeled_indices:
+                labeled_mel = mel[labeled_indices]
+                labeled_targets = torch.tensor([student_label_map[label_batch[i]] for i in labeled_indices], dtype=torch.long, device=device)
+                base_features = student_encoder(labeled_mel)
+                supervised_features, _ = student_branch(base_features)
+                student_logits = student_classifier(supervised_features, student_text_emb)
+                hard_total, hard_loss, _, _ = criterion(student_logits, hard_targets=labeled_targets)
+                loss = loss + hard_total
+                total_hard_loss += hard_loss.item()
+
+            if unlabeled_indices:
+                unlabeled_mel = mel[unlabeled_indices]
+                fusion_output = ensemble_teacher(unlabeled_mel, student_label_map)
+                base_features = student_encoder(unlabeled_mel)
+                supervised_features, distill_features = student_branch(base_features)
+                student_logits = student_classifier(supervised_features, student_text_emb)
+                soft_total, _, soft_loss, feat_loss = criterion(
+                    student_logits,
+                    teacher_logits=fusion_output.logits,
+                    student_features=distill_features,
+                    teacher_features=fusion_output.features,
+                )
+                loss = loss + soft_total
+                total_soft_loss += soft_loss.item()
+                total_feat_loss += feat_loss.item()
+                teacher_feature_cache.append(fusion_output.features.detach().cpu())
+                for local_pos, batch_idx in enumerate(unlabeled_indices):
+                    meta = dict(metadata_batch[batch_idx])
+                    meta["teacher_disagreement"] = float(fusion_output.disagreement[local_pos].item())
+                    meta["teacher_uncertainty"] = float(fusion_output.uncertainty[local_pos].item())
+                    meta["teacher_specialist_weights"] = {
+                        name: float(weight[local_pos].item())
+                        for name, weight in fusion_output.specialist_weights.items()
+                    }
+                    unlabeled_metadata_cache.append(meta)
+
+            if loss.requires_grad and loss.item() > 0:
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+
+        avg_loss = total_loss / max(1, len(train_loader))
+        avg_hard = total_hard_loss / max(1, len(train_loader))
+        avg_soft = total_soft_loss / max(1, len(train_loader))
+        avg_feat = total_feat_loss / max(1, len(train_loader))
+        train_hist.append(avg_loss)
+
+        student_encoder.eval()
+        student_branch.eval()
+        val_total = 0.0
+        with torch.no_grad():
+            for mel_batch, label_batch, _ in val_loader:
+                mel = mel_batch.to(device)
+                targets = torch.tensor([student_label_map[lbl] for lbl in label_batch], dtype=torch.long, device=device)
+                base_features = student_encoder(mel)
+                supervised_features, _ = student_branch(base_features)
+                logits = student_classifier(supervised_features, student_text_emb)
+                val_loss, _, _, _ = criterion(logits, hard_targets=targets)
+                val_total += val_loss.item()
+        avg_val = val_total / max(1, len(val_loader))
+        val_hist.append(avg_val)
+
+        print(f"[Epoch {epoch+1}] Total {avg_loss:.4f} | Hard {avg_hard:.4f} | Soft {avg_soft:.4f} | Feat {avg_feat:.4f} | Val {avg_val:.4f}")
+
+    print("Training finished.")
+    save_checkpoint(
+        os.path.join(BASE_DIR, f"student_model_{mark_version}.pth"),
+        model_type="student_full",
+        mark_version=mark_version,
+        model_state=student_encoder.state_dict(),
+        branch_state=student_branch.state_dict(),
+        classifier_state=student_classifier.state_dict(),
+    )
+    if teacher_feature_cache:
+        torch.save(torch.cat(teacher_feature_cache, dim=0), get_feature_cache_path(PROJECT_ROOT, mark_version, "unlabeled_train"))
+    if unlabeled_metadata_cache:
+        torch.save(unlabeled_metadata_cache, get_metadata_cache_path(PROJECT_ROOT, mark_version, "unlabeled_train"))
+
+    plot_dir = os.path.join(PROJECT_ROOT, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    plt.figure(figsize=(8, 5))
+    plt.plot(train_hist, label="Train")
+    plt.plot(val_hist, label="Val")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(f"Student Loss ({mark_version})")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_dir, f"loss_curve_student_{mark_version}.png"))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="mark5.0 Student 모델을 학습합니다.")
+    parser.add_argument("--mark_version", type=str, default="mark5.0")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    train_mark5(seed_value=args.seed, mark_version=args.mark_version)

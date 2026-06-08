@@ -1,7 +1,7 @@
 import os
 import sys
 
-SHARED_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "shared_vild"))
+SHARED_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shared_vild"))
 if SHARED_DIR not in sys.path:
     sys.path.append(SHARED_DIR)
 

@@ -6,7 +6,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 import os
 
-SHARED_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "shared_vild"))
+SHARED_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shared_vild"))
 if SHARED_DIR not in os.sys.path:
     os.sys.path.append(SHARED_DIR)
 
@@ -45,7 +45,7 @@ class AudioViLDConfig:
         else:
             raise ValueError(
                 f"[Error] Unknown or unsupported mark_version: '{self.mark_version}'.\n"
-                f"지원되는 값: ['mark4.1', 'mark4.2', 'mark4.3', 'mark4.4', 'mark4.5', 'mark4.6', 'mark4.7', mark4.8', 'mark5.0']"
+                f"지원되는 값: ['mark4.1', 'mark4.2', 'mark4.3', 'mark4.4', 'mark4.5', 'mark4.6', 'mark4.7', 'mark4.8', 'mark5.0']"
             )
 
         # === 기존 속성 유지 ===
@@ -110,7 +110,7 @@ class AudioViLDConfig:
 
         # === 데이터 경로 ===
         self.audio_dir = os.path.join("data_wav")
-        self.prompt_bank_path = os.path.join(os.path.dirname(SHARED_DIR), "shared_vild", "resources", "prompt_bank.json")
+        self.prompt_bank_path = os.path.join(SHARED_DIR, "resources", "prompt_bank.json")
 
         # === 내부 캐시 ===
         self._text_emb = None

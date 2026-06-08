@@ -27,7 +27,7 @@ from vild_head import DualBranchStudentHead
 from vild_parser_teacher import AudioParser
 from teacher_fusion import WeightedTeacherFusion
 from seed_utils import set_seed
-SHARED_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, "..", "shared_vild"))
+SHARED_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, "shared_vild"))
 if SHARED_DIR not in sys.path:
     sys.path.append(SHARED_DIR)
 from checkpoint_utils import apply_config_metadata, load_checkpoint, resolve_state_dict, save_checkpoint

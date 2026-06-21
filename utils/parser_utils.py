@@ -36,13 +36,23 @@ def load_audio_file(file_path, target_sample_rate, resampler_cache=None):
         logging.warning(f"[Empty] 비어있는 파일: {file_path_norm}")
         return None
 
-    # 모노 변환
-    if waveform.ndim > 1:
+    # [변경] mark4와 동일하게 (T, C)/(C, T) 모두 대응. 작은 축을 채널로 간주해 평균.
+    if waveform.ndim == 2:
         try:
-            waveform = waveform.mean(dim=1)  # (채널, 샘플 수) -> 모노
+            dim_time, dim_chan = waveform.shape
+            if dim_time >= dim_chan:
+                # (T, C)로 판단 → 채널 평균
+                waveform = waveform.mean(dim=1)
+            else:
+                # (C, T)로 판단 → 채널 평균
+                waveform = waveform.mean(dim=0)
         except Exception as e:
             logging.error(f"[Mono Fail] 다채널 평균화 실패: {file_path_norm} -> {e}")
             return None
+    elif waveform.ndim > 2:
+        logging.error(f"[Shape Error] 예상 외 차원: {waveform.shape} @ {file_path_norm}")
+        return None
+    # 1D는 그대로 사용
 
     waveform = waveform.view(1, -1)  # [1, T]
 

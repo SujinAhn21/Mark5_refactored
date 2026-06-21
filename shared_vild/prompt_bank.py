@@ -25,7 +25,6 @@ _DEFAULT_SYNONYMS = {
     "water_shower": ["shower water", "shower running", "bathroom shower sound"],
     "dog_bark": ["dog bark", "barking dog", "canine bark"],
     "others": ["other sound", "background noise", "non target sound"],
-    "dummy_label": ["other sound", "background noise", "non target sound"],
 }
 
 _cache = {}

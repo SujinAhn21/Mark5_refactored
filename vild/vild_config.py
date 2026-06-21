@@ -7,8 +7,10 @@ from sentence_transformers import SentenceTransformer
 import os
 
 SHARED_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shared_vild"))
+# [변경] append -> insert(0): prompt_bank 등 공용 모듈이 vild/ 등 다른 경로보다 항상 우선
+# 해석되도록 shared_vild를 sys.path 앞쪽에 둔다. (구버전 vild/prompt_bank.py shadow 방지)
 if SHARED_DIR not in os.sys.path:
-    os.sys.path.append(SHARED_DIR)
+    os.sys.path.insert(0, SHARED_DIR)
 
 from prompt_bank import get_class_synonyms, get_prompt_templates, get_prompt_texts_for_class
 
@@ -36,11 +38,13 @@ class AudioViLDConfig:
         elif self.mark_version == "mark4.8":
             self.classes = ["dog_bark", "others"]
         elif self.mark_version == "mark5.0":
+            # [변경] 'dummy_label' 제거. mark5 학습/평가 경로는 load_and_segment_with_metadata만
+            # 사용하고 unlabeled는 label=-1로 처리되어 dummy_label이 실제로 쓰이지 않음(잔재).
+            # student 출력/loss는 아래 9개 클래스로 고정한다.
             self.classes = [
                 "heavy_impact", "dragging", "construction", "machine_noise",
                 "media_talking", "water_toilet", "water_shower", "dog_bark",
-                "others", 
-                "dummy_label" # vild_parser_teacher가 unlabeled 데이터를 처리하기 위한 임시 레이블
+                "others",
             ]
         else:
             raise ValueError(

@@ -107,7 +107,8 @@ def process_labeled_folder(data_dir, output_csv, plot_path, config):
     entries = []
     label_count = defaultdict(int)
     found_labels = set()
-    expected_labels = set(config.get_classes_for_text_prompts())
+    # [변경] dummy_label을 포함하던 get_classes_for_text_prompts() 대신 평가용 9-class 사용.
+    expected_labels = set(config.get_classes_for_evaluation())
 
     for class_name in sorted(os.listdir(data_dir)):
         class_dir = os.path.join(data_dir, class_name)
@@ -117,18 +118,28 @@ def process_labeled_folder(data_dir, output_csv, plot_path, config):
             for path in audio_files:
                 entries.append((path.replace("\\", "/"), class_name))
                 label_count[class_name] += 1
-    
+
+    # [추가] 9-class 밖 폴더명은 옛 6-class(Mark3.2) 잔재일 수 있음.
+    # 조용히 통과시키면 학습/평가에서 무음 탈락하므로 CSV를 쓰기 전에 즉시 중단한다.
+    unexpected = found_labels - expected_labels
+    if unexpected:
+        raise ValueError(
+            f"[ERROR] 9-class 체계에 없는 폴더명이 발견되었습니다: {sorted(unexpected)}\n"
+            f"  - 허용된 클래스(9): {sorted(expected_labels)}\n"
+            f"  - 검사 경로: {data_dir}\n"
+            f"  => 옛 6-class(Mark3.2) 잔재일 수 있습니다. "
+            f"폴더명을 9-class로 정리한 뒤 다시 실행하세요."
+        )
+
     entries.sort(key=lambda x: x[0])
     mirror_csv(entries, os.path.basename(output_csv), header=["path", "label"])
 
     print("\n--- 데이터 요약 ---")
     print(f"총 {len(entries)}개의 인덱스를 생성했습니다.")
-    
+
     missing = expected_labels - found_labels
-    if missing: print(f"[경고] 설정에 있으나 폴더가 없는 클래스: {sorted(list(missing))}")
-    
-    unexpected = found_labels - expected_labels
-    if unexpected: print(f"[경고] 폴더는 있으나 설정에 없는 클래스: {sorted(list(unexpected))}")
+    if missing:
+        print(f"[경고] 설정에 있으나 폴더가 없는 클래스: {sorted(list(missing))}")
 
     print("\n[라벨 분포]")
     for label, count in sorted(label_count.items()):

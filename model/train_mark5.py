@@ -62,6 +62,7 @@ class EnsembleTeacher:
         self.device = device
         self.specialists = {}
         self.embedding_dim = None
+        self.fusion = None  # WeightedTeacherFusion은 배치마다 재생성하지 않고 1회 생성 후 재사용
         for class_name, paths in specialist_config.items():
             encoder_ckpt = load_checkpoint(_resolve_resource_path(paths["encoder_path"]), map_location=device)
             config = AudioViLDConfig(mark_version=paths["mark_version"])
@@ -97,7 +98,9 @@ class EnsembleTeacher:
                 "logits": logits,
                 "features": region_emb,
             }
-        return WeightedTeacherFusion(student_class_map, self.embedding_dim, self.device).fuse(fusion_inputs)
+        if self.fusion is None:
+            self.fusion = WeightedTeacherFusion(student_class_map, self.embedding_dim, self.device)
+        return self.fusion.fuse(fusion_inputs)
 
 
 class SemiSupervisedDataset(Dataset):
@@ -108,10 +111,13 @@ class SemiSupervisedDataset(Dataset):
         self.is_labeled = is_labeled
         valid_labels = set(config.get_classes_for_evaluation()) if is_labeled else None
 
+        skipped_label_counter = {}
         for item in file_path_list:
             path = item["path"]
             label = item.get("label")
             if is_labeled and label not in valid_labels:
+                # [추가] 9-class 밖 라벨은 조용히 넘기지 않고 집계
+                skipped_label_counter[label] = skipped_label_counter.get(label, 0) + 1
                 continue
             try:
                 segment_records = parser.load_and_segment_with_metadata(path)
@@ -129,6 +135,20 @@ class SemiSupervisedDataset(Dataset):
                         self.samples.append((seg, label if is_labeled else -1, metadata))
             except Exception as e:
                 print(f"[ERROR] Failed to parse {path}: {e}")
+
+        # [추가] 조용한 탈락 방지: 9-class 밖 라벨이 있으면 개수와 함께 보고하고,
+        # labeled인데 유효 샘플이 0개면 즉시 중단(옛 6-class 데이터로 돌리는 사고 방지).
+        if skipped_label_counter:
+            print(
+                f"[WARN] 9-class 밖 라벨로 건너뛴 labeled 파일: {skipped_label_counter} "
+                f"(허용 클래스: {sorted(valid_labels)})"
+            )
+        if is_labeled and len(self.samples) == 0:
+            raise ValueError(
+                f"[ERROR] 유효한 labeled 세그먼트가 0개입니다. 입력 {len(file_path_list)}개가 모두 탈락했습니다. "
+                f"건너뛴 라벨: {skipped_label_counter}. "
+                "데이터 폴더/CSV 라벨이 9-class와 일치하는지 확인하세요."
+            )
 
     def __len__(self):
         return len(self.samples)
@@ -236,6 +256,14 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
     student_text_emb = config.get_class_text_embeddings(for_evaluation=True).to(device)
     student_label_map = config.get_target_label_map()
 
+    # [추가] dummy_label 등이 student 차원에 새지 않았는지 즉시 검증(누수 시 학습 전에 터지게).
+    eval_classes = config.get_classes_for_evaluation()
+    assert student_text_emb.shape[0] == len(student_label_map) == len(eval_classes), (
+        f"[ERROR] student 클래스 차원 불일치: text_emb={student_text_emb.shape[0]}, "
+        f"label_map={len(student_label_map)}, eval_classes={len(eval_classes)} (현재 기대값 9). "
+        "for_evaluation=True 누락 또는 dummy_label 누수/ config 불일치를 의심하세요."
+    )
+
     specialist_config = {
         "heavy_impact": {"mark_version": "mark4.1", "encoder_path": "best_teacher_encoder_mark4.1.pth", "classifier_path": "best_teacher_classifier_mark4.1.pth"},
         "dragging": {"mark_version": "mark4.2", "encoder_path": "best_teacher_encoder_mark4.2.pth", "classifier_path": "best_teacher_classifier_mark4.2.pth"},
@@ -254,6 +282,13 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
     optimizer = optim.Adam(list(student_encoder.parameters()) + list(student_branch.parameters()), lr=config.learning_rate)
 
     train_hist, val_hist = [], []
+    # [추가] train/val 직접 비교를 위해 컴포넌트별 손실 히스토리 분리 기록
+    #  - train_hist        : Total(hard+soft+feat)  → 참고용
+    #  - train_hard_hist   : raw hard CE            → val_hard_hist와 직접 비교 가능
+    #  - train_soft/feat   : KD 컴포넌트            → 학습 진행 참고용
+    #  - val_hard_hist     : val의 raw hard CE      → train_hard_hist와 직접 비교 가능
+    train_hard_hist, train_soft_hist, train_feat_hist = [], [], []
+    val_hard_hist = []
     print(f"[INFO] Student training ({mark_version}) started on {device}")
     for epoch in range(config.num_epochs):
         student_encoder.train()
@@ -314,10 +349,14 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
         avg_soft = total_soft_loss / max(1, len(train_loader))
         avg_feat = total_feat_loss / max(1, len(train_loader))
         train_hist.append(avg_loss)
+        train_hard_hist.append(avg_hard)
+        train_soft_hist.append(avg_soft)
+        train_feat_hist.append(avg_feat)
 
         student_encoder.eval()
         student_branch.eval()
         val_total = 0.0
+        val_hard_total = 0.0
         with torch.no_grad():
             for mel_batch, label_batch, _ in val_loader:
                 mel = mel_batch.to(device)
@@ -325,12 +364,16 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
                 base_features = student_encoder(mel)
                 supervised_features, _ = student_branch(base_features)
                 logits = student_classifier(supervised_features, student_text_emb)
-                val_loss, _, _, _ = criterion(logits, hard_targets=targets)
+                # [수정] total((1-α)·hard)뿐 아니라 raw hard CE도 따로 기록해 train_hard와 동일 척도로 비교
+                val_loss, val_hard, _, _ = criterion(logits, hard_targets=targets)
                 val_total += val_loss.item()
+                val_hard_total += val_hard.item()
         avg_val = val_total / max(1, len(val_loader))
+        avg_val_hard = val_hard_total / max(1, len(val_loader))
         val_hist.append(avg_val)
+        val_hard_hist.append(avg_val_hard)
 
-        print(f"[Epoch {epoch+1}] Total {avg_loss:.4f} | Hard {avg_hard:.4f} | Soft {avg_soft:.4f} | Feat {avg_feat:.4f} | Val {avg_val:.4f}")
+        print(f"[Epoch {epoch+1}] Total {avg_loss:.4f} | Hard {avg_hard:.4f} | Soft {avg_soft:.4f} | Feat {avg_feat:.4f} | Val(hard*) {avg_val_hard:.4f}")
 
     print("Training finished.")
     save_checkpoint(
@@ -348,12 +391,19 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
 
     plot_dir = os.path.join(PROJECT_ROOT, "plots")
     os.makedirs(plot_dir, exist_ok=True)
-    plt.figure(figsize=(8, 5))
-    plt.plot(train_hist, label="Train")
-    plt.plot(val_hist, label="Val")
+    # [수정] train 총손실(hard+soft+feat)과 val(hard만)을 한 축에서 직접 비교하면
+    #        측정 대상이 달라 과적합을 오판할 수 있음.
+    #   -> 직접 비교 가능한 'Train Hard(raw CE) vs Val Hard(raw CE)'를 주 곡선(굵게)으로,
+    #      Train Total/Soft/Feat은 학습 진행 참고용(점/파선)으로 함께 표기.
+    plt.figure(figsize=(9, 6))
+    plt.plot(train_hist, label="Train Total (hard+soft+feat, 참고)", linestyle="--", alpha=0.55)
+    plt.plot(train_soft_hist, label="Train Soft KD (참고)", linestyle=":", alpha=0.55)
+    plt.plot(train_feat_hist, label="Train Feat KD (참고)", linestyle=":", alpha=0.55)
+    plt.plot(train_hard_hist, label="Train Hard (raw CE)", linewidth=2)
+    plt.plot(val_hard_hist, label="Val Hard (raw CE)", linewidth=2)
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    plt.title(f"Student Loss ({mark_version})")
+    plt.title(f"Student Loss ({mark_version})\n* 직접 비교는 Train Hard vs Val Hard (동일 raw CE) 기준")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()

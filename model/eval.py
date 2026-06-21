@@ -78,10 +78,13 @@ def evaluate(mark_version: str):
 
     all_labels, all_preds, all_probs = [], [], []
     calibration_rows = []
+    skipped_label_counter = {}
     for row in test_files:
         path = row["path"]
         label = row["label"]
         if label not in label_map:
+            # [추가] 9-class 밖 라벨은 조용히 넘기지 않고 집계
+            skipped_label_counter[label] = skipped_label_counter.get(label, 0) + 1
             continue
         segment_records = parser.load_and_segment_with_metadata(path)
         if not segment_records:
@@ -122,6 +125,18 @@ def evaluate(mark_version: str):
             "entropy": calib_meta["entropy"],
         })
         save_visual_explanation(path, segment_records, segment_probs, seg_weights, class_names, calibrated_prob, pred, config, plot_dir)
+
+    # [추가] 조용한 탈락 방지: 9-class 밖 라벨 보고 + 평가 샘플 0이면 즉시 중단
+    if skipped_label_counter:
+        print(
+            f"[WARN] 9-class 밖 라벨로 건너뛴 test 파일: {skipped_label_counter} "
+            f"(허용 클래스: {sorted(label_map.keys())})"
+        )
+    if len(all_labels) == 0:
+        raise ValueError(
+            f"[ERROR] 평가 가능한 test 샘플이 0개입니다. 건너뛴 라벨: {skipped_label_counter}. "
+            "dataset_test.csv 라벨이 9-class와 일치하는지 확인하세요."
+        )
 
     report = classification_report(
         all_labels,

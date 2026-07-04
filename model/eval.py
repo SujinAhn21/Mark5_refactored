@@ -9,7 +9,15 @@ import pandas as pd
 import seaborn as sns
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.metrics import (
+    accuracy_score,
+    auc,
+    classification_report,
+    confusion_matrix,
+    precision_recall_fscore_support,
+    roc_auc_score,
+    roc_curve,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
@@ -196,6 +204,54 @@ def evaluate(mark_version: str):
     plt.tight_layout()
     plt.savefig(os.path.join(plot_dir, f"confusion_matrix_{mark_version}.png"))
     plt.close()
+
+    # [추가] mark4 eval.py와 동일한 형태로 Accuracy/P/R/F1/ROC AUC를 CSV로 저장(기존엔 콘솔 print만 하고 파일에 안 남았음).
+    all_probs_arr = np.array(all_probs)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average=None, labels=list(range(len(class_names))), zero_division=0
+    )
+    roc_auc_macro = roc_auc_score(all_labels, all_probs_arr, multi_class="ovr", average="macro")
+    print(f"ROC AUC (macro, one-vs-rest): {roc_auc_macro:.4f}")
+
+    # [추가] others FPR: 실제 라벨이 "others"인데 8개 타겟 클래스 중 하나로 오분류된 비율.
+    # = 1 - Recall(others). "조용한 배경음을 소음으로 잘못 경보하는 비율"이라는 실용적 의미를 명시하기 위해 별도 계산.
+    others_idx = class_names.index("others")
+    others_row = cm[others_idx]
+    others_row_sum = int(others_row.sum())
+    others_fpr = float((others_row_sum - others_row[others_idx]) / others_row_sum) if others_row_sum > 0 else float("nan")
+    print(f"[others FPR] 실제 others인데 타겟 클래스로 오분류된 비율: {others_fpr:.4f}")
+
+    # [추가] mark4 eval.py의 roc_curve 저장과 동일한 형태(9-class는 one-vs-rest로 클래스별 곡선).
+    plt.figure(figsize=(7, 6))
+    all_labels_arr = np.array(all_labels)
+    for i, cname in enumerate(class_names):
+        fpr_curve, tpr_curve, _ = roc_curve((all_labels_arr == i).astype(int), all_probs_arr[:, i])
+        auc_i = auc(fpr_curve, tpr_curve)
+        plt.plot(fpr_curve, tpr_curve, label=f"{cname} AUC={auc_i:.3f}")
+    plt.plot([0, 1], [0, 1], "k--")
+    plt.xlim([0, 1])
+    plt.ylim([0, 1.05])
+    plt.xlabel("FPR")
+    plt.ylabel("TPR")
+    plt.title(f"ROC ({mark_version})")
+    plt.legend(loc="lower right", fontsize=8)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_dir, f"roc_curve_{mark_version}.png"))
+    plt.close()
+
+    summary_csv = os.path.join(plot_dir, f"performance_summary_{mark_version}.csv")
+    with open(summary_csv, "w", newline="", encoding="utf-8") as f:
+        f.write(f"# Performance Summary for {mark_version}\n\n")
+        pd.DataFrame({
+            "Metric": ["Accuracy", "ROC AUC (Macro, OvR)", "Others FPR"],
+            "Score": [accuracy, roc_auc_macro, others_fpr],
+        }).to_csv(f, index=False)
+        f.write("\n# Class-wise Metrics\n\n")
+        pd.DataFrame({
+            "Class": class_names, "Precision": precision, "Recall": recall, "F1-Score": f1,
+        }).to_csv(f, index=False)
+    print(f"[INFO] 성능 요약 CSV 저장: {summary_csv}")
 
     if calibration_rows:
         pd.DataFrame(calibration_rows).to_csv(

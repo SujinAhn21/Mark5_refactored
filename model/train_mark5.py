@@ -433,6 +433,19 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
     plt.tight_layout()
     plt.savefig(os.path.join(plot_dir, f"loss_curve_student_{mark_version}.png"))
 
+    # [추가] 손실곡선 raw 숫자를 CSV로도 저장. PNG만 있으면 다른 모델(CED-Tiny 등)과
+    # 겹쳐 그리는 비교 그래프를 다시 만들 수 없어서, 비교 실험용으로 숫자 그대로 남긴다.
+    loss_history_csv = os.path.join(plot_dir, f"loss_history_{mark_version}.csv")
+    with open(loss_history_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "train_total", "train_hard", "train_soft", "train_feat", "train_bg", "val_total", "val_hard"])
+        for i in range(len(train_hist)):
+            writer.writerow([
+                i + 1, train_hist[i], train_hard_hist[i], train_soft_hist[i],
+                train_feat_hist[i], train_bg_hist[i], val_hist[i], val_hard_hist[i],
+            ])
+    print(f"[INFO] 손실곡선 CSV 저장: {loss_history_csv}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="mark5.0 Student 모델을 학습합니다.")

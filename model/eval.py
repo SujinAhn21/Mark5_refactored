@@ -210,8 +210,19 @@ def evaluate(mark_version: str):
     precision, recall, f1, _ = precision_recall_fscore_support(
         all_labels, all_preds, average=None, labels=list(range(len(class_names))), zero_division=0
     )
-    roc_auc_macro = roc_auc_score(all_labels, all_probs_arr, multi_class="ovr", average="macro")
-    print(f"ROC AUC (macro, one-vs-rest): {roc_auc_macro:.4f}")
+    # [수정] labels 명시 + try/except로 방어. 테스트셋에 9-class 중 일부가 아예 없으면
+    # (1) labels 없이는 "열 개수 불일치"로 죽고, (2) labels를 줘도 그 클래스의 OvR 이진화가
+    # "양성 샘플 0개"가 되어 AUC 자체가 수학적으로 정의 불가능해 여전히 ValueError가 난다.
+    # 작은 test set에서는 흔히 벌어질 수 있는 상황이라, 죽이지 않고 NaN 처리 후 경고만 남긴다.
+    try:
+        roc_auc_macro = roc_auc_score(
+            all_labels, all_probs_arr, multi_class="ovr", average="macro",
+            labels=list(range(len(class_names))),
+        )
+        print(f"ROC AUC (macro, one-vs-rest): {roc_auc_macro:.4f}")
+    except ValueError as e:
+        roc_auc_macro = float("nan")
+        print(f"[WARN] ROC AUC 계산 불가(테스트셋에 없는 클래스가 있을 수 있음): {e}")
 
     # [추가] others FPR: 실제 라벨이 "others"인데 8개 타겟 클래스 중 하나로 오분류된 비율.
     # = 1 - Recall(others). "조용한 배경음을 소음으로 잘못 경보하는 비율"이라는 실용적 의미를 명시하기 위해 별도 계산.

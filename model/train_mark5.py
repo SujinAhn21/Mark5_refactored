@@ -22,7 +22,7 @@ for p in (PROJECT_ROOT, UTILS_DIR, VILD_DIR):
 
 from feature_cache import get_feature_cache_path, get_metadata_cache_path
 from vild_config import AudioViLDConfig
-from vild_model import ViLDTextHead, build_audio_encoder
+from vild_model import LearnableBackgroundEmbedding, ViLDTextHead, build_audio_encoder
 from vild_head import DualBranchStudentHead
 from vild_parser_teacher import AudioParser
 from teacher_fusion import WeightedTeacherFusion
@@ -264,6 +264,11 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
         "for_evaluation=True 누락 또는 dummy_label 누수/ config 불일치를 의심하세요."
     )
 
+    # [추가] 학습형 background(others) 임베딩. use_background_embedding=False면 사용하지 않음(None).
+    background_embedding = None
+    if config.use_background_embedding:
+        background_embedding = LearnableBackgroundEmbedding(config.embedding_dim).to(device)
+
     specialist_config = {
         "heavy_impact": {"mark_version": "mark4.1", "encoder_path": "best_teacher_encoder_mark4.1.pth", "classifier_path": "best_teacher_classifier_mark4.1.pth"},
         "dragging": {"mark_version": "mark4.2", "encoder_path": "best_teacher_encoder_mark4.2.pth", "classifier_path": "best_teacher_classifier_mark4.2.pth"},
@@ -279,7 +284,10 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
     unlabeled_metadata_cache = []
 
     criterion = DistillationLoss(temperature=4.0, alpha=0.7, feature_kd_weight=config.feature_kd_weight if config.use_feature_kd else 0.0)
-    optimizer = optim.Adam(list(student_encoder.parameters()) + list(student_branch.parameters()), lr=config.learning_rate)
+    optimizer_params = list(student_encoder.parameters()) + list(student_branch.parameters())
+    if background_embedding is not None:
+        optimizer_params += list(background_embedding.parameters())
+    optimizer = optim.Adam(optimizer_params, lr=config.learning_rate)
 
     train_hist, val_hist = [], []
     # [추가] train/val 직접 비교를 위해 컴포넌트별 손실 히스토리 분리 기록
@@ -288,12 +296,15 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
     #  - train_soft/feat   : KD 컴포넌트            → 학습 진행 참고용
     #  - val_hard_hist     : val의 raw hard CE      → train_hard_hist와 직접 비교 가능
     train_hard_hist, train_soft_hist, train_feat_hist = [], [], []
+    # [추가] background embedding 보조 loss(bg_loss) 히스토리
+    train_bg_hist = []
     val_hard_hist = []
     print(f"[INFO] Student training ({mark_version}) started on {device}")
     for epoch in range(config.num_epochs):
         student_encoder.train()
         student_branch.train()
         total_loss = total_hard_loss = total_soft_loss = total_feat_loss = 0.0
+        total_bg_loss = 0.0
 
         for mel_batch, label_batch, metadata_batch in train_loader:
             mel = mel_batch.to(device)
@@ -312,6 +323,16 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
                 hard_total, hard_loss, _, _ = criterion(student_logits, hard_targets=labeled_targets)
                 loss = loss + hard_total
                 total_hard_loss += hard_loss.item()
+
+                if config.use_background_embedding and background_embedding is not None:
+                    others_idx = student_label_map["others"]
+                    others_mask = (labeled_targets == others_idx)
+                    if others_mask.any():
+                        target_feat = F.normalize(supervised_features[others_mask], dim=1)
+                        bg = F.normalize(background_embedding(), dim=0).unsqueeze(0).expand_as(target_feat)
+                        bg_loss = (1 - F.cosine_similarity(target_feat, bg, dim=1)).mean()
+                        loss = loss + config.background_embedding_weight * bg_loss
+                        total_bg_loss += bg_loss.item()
 
             if unlabeled_indices:
                 unlabeled_mel = mel[unlabeled_indices]
@@ -348,10 +369,12 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
         avg_hard = total_hard_loss / max(1, len(train_loader))
         avg_soft = total_soft_loss / max(1, len(train_loader))
         avg_feat = total_feat_loss / max(1, len(train_loader))
+        avg_bg = total_bg_loss / max(1, len(train_loader))
         train_hist.append(avg_loss)
         train_hard_hist.append(avg_hard)
         train_soft_hist.append(avg_soft)
         train_feat_hist.append(avg_feat)
+        train_bg_hist.append(avg_bg)
 
         student_encoder.eval()
         student_branch.eval()
@@ -373,7 +396,7 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
         val_hist.append(avg_val)
         val_hard_hist.append(avg_val_hard)
 
-        print(f"[Epoch {epoch+1}] Total {avg_loss:.4f} | Hard {avg_hard:.4f} | Soft {avg_soft:.4f} | Feat {avg_feat:.4f} | Val(hard*) {avg_val_hard:.4f}")
+        print(f"[Epoch {epoch+1}] Total {avg_loss:.4f} | Hard {avg_hard:.4f} | Soft {avg_soft:.4f} | Feat {avg_feat:.4f} | BG {avg_bg:.4f} | Val(hard*) {avg_val_hard:.4f}")
 
     print("Training finished.")
     save_checkpoint(
@@ -383,6 +406,7 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
         model_state=student_encoder.state_dict(),
         branch_state=student_branch.state_dict(),
         classifier_state=student_classifier.state_dict(),
+        background_state=background_embedding.state_dict() if background_embedding is not None else None,
     )
     if teacher_feature_cache:
         torch.save(torch.cat(teacher_feature_cache, dim=0), get_feature_cache_path(PROJECT_ROOT, mark_version, "unlabeled_train"))

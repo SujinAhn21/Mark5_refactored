@@ -78,6 +78,8 @@ class AudioViLDConfig:
         # === 모델 파라미터 ===
         self.embedding_dim = 384
         self.use_background_embedding = True
+        # [추가] background embedding 보조 loss 가중치 (use_background_embedding=True일 때만 의미 있음)
+        self.background_embedding_weight = 0.1
         self.use_text_aligned_student = True
         self.use_feature_kd = True
         self.feature_kd_weight = 0.3
@@ -100,6 +102,9 @@ class AudioViLDConfig:
         self.temporal_smoothing_alpha = 0.65
         self.enable_abstention = False
         self.abstention_confidence_threshold = 0.40
+        # [추가] eval 시 supervised_features 로짓과 distill_features 로짓을 섞는 비중.
+        # 0=supervised만, 1=distill만, 0.5=평균
+        self.distill_branch_eval_weight = 0.5
         self.explain_topk_segments = 3
         self.save_visual_explanations = True
         self.encoder_type = "cnn"

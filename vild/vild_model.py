@@ -148,6 +148,22 @@ class ViLDTextHead(nn.Module):
         return logits
 
 
+class LearnableBackgroundEmbedding(nn.Module):
+    """
+    'others'(배경) 클래스를 위한 학습형 임베딩.
+
+    ViLDTextHead가 계산하는 cosine similarity 로짓 공간과 동일한 embedding_dim을 사용하며,
+    eval 시 'others' 로짓을 max-override 방식으로 보정하는 데 쓰인다.
+    """
+
+    def __init__(self, embedding_dim):
+        super().__init__()
+        self.background_emb = nn.Parameter(torch.randn(embedding_dim) * 0.01)
+
+    def forward(self):
+        return self.background_emb
+
+
 def build_audio_encoder(config):
     encoder_type = getattr(config, "encoder_type", "cnn")
     if encoder_type == "residual_cnn":

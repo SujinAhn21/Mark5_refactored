@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
+import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -27,7 +28,7 @@ from postprocess_utils import (
     save_visual_explanation,
 )
 from vild_config import AudioViLDConfig
-from vild_model import ViLDTextHead, build_audio_encoder
+from vild_model import LearnableBackgroundEmbedding, ViLDTextHead, build_audio_encoder
 from vild_head import DualBranchStudentHead
 from vild_parser_teacher import AudioParser
 SHARED_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, "shared_vild"))
@@ -67,6 +68,19 @@ def evaluate(mark_version: str):
         print("[WARN] branch_state_dict가 없어 기본 branch head로 평가합니다. 새 모델 재학습이 권장됩니다.")
     text_head = ViLDTextHead(config).to(device)
     text_emb = config.get_class_text_embeddings(for_evaluation=True).to(device)
+
+    # [추가] 학습형 background(others) 임베딩 로드. use_background_embedding=False거나
+    # 체크포인트에 없으면(구버전 호환) None으로 두고 아래 max-override 로직을 건너뜀.
+    background_embedding = None
+    if config.use_background_embedding:
+        bg_state = checkpoint.get("background_state_dict")
+        if bg_state is not None:
+            background_embedding = LearnableBackgroundEmbedding(config.embedding_dim).to(device)
+            background_embedding.load_state_dict(bg_state)
+            background_embedding.eval()
+        else:
+            print("[WARN] background_state_dict가 없어 background embedding 없이 평가합니다. 새 모델 재학습이 권장됩니다.")
+
     encoder.eval()
     branch_head.eval()
     text_head.eval()
@@ -99,9 +113,29 @@ def evaluate(mark_version: str):
                     seg = seg.unsqueeze(0)
                 seg = seg.to(device)
                 base_features = encoder(seg)
-                supervised_features, _ = branch_head(base_features)
-                logits = text_head(supervised_features, text_emb)
-                prob = torch.softmax(logits, dim=-1).squeeze(0).cpu().numpy()
+                supervised_features, distill_features = branch_head(base_features)
+                sup_logits = text_head(supervised_features, text_emb)
+                distill_logits = text_head(distill_features, text_emb)
+
+                if background_embedding is not None:
+                    others_idx = class_names.index("others")
+                    bg_norm = F.normalize(background_embedding(), dim=0)
+
+                    sup_norm = F.normalize(supervised_features, dim=1)
+                    sup_bg_logit = (sup_norm @ bg_norm) / text_head.temperature
+                    sup_logits = sup_logits.clone()
+                    sup_logits[:, others_idx] = torch.maximum(sup_logits[:, others_idx], sup_bg_logit)
+
+                    distill_norm = F.normalize(distill_features, dim=1)
+                    distill_bg_logit = (distill_norm @ bg_norm) / text_head.temperature
+                    distill_logits = distill_logits.clone()
+                    distill_logits[:, others_idx] = torch.maximum(distill_logits[:, others_idx], distill_bg_logit)
+
+                w = getattr(config, "distill_branch_eval_weight", 0.5)
+                prob = (
+                    (1 - w) * torch.softmax(sup_logits, dim=-1)
+                    + w * torch.softmax(distill_logits, dim=-1)
+                ).squeeze(0).cpu().numpy()
                 segment_probs.append(prob)
 
         if config.enable_temporal_smoothing:

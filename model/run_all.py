@@ -63,18 +63,18 @@ def run_subprocess(command_list):
 # ===== mark5.0 단계별 실행 함수 정의 =====
 @timed_step
 def run_step0_preprocess_labeled_data():
-    """Labeled 원본 오디오를 고정된 길이로 전처리합니다."""
+    """Labeled 원본 오디오를 최소 길이 보장(패딩만, 자르지 않음)으로 전처리합니다."""
     return run_subprocess([
-        sys.executable, os.path.join(pre_dir, "fix_audio_length_to_240000.py"),
+        sys.executable, os.path.join(pre_dir, "fix_audio_length.py"),
         "--input_dir", os.path.join(project_root, "data_source_labeled"),
         "--output_dir", os.path.join(project_root, "data_labeled")
     ])
 
 @timed_step
 def run_step1_preprocess_unlabeled_data():
-    """Unlabeled 원본 오디오를 고정된 길이로 전처리합니다."""
+    """Unlabeled 원본 오디오를 최소 길이 보장(패딩만, 자르지 않음)으로 전처리합니다."""
     return run_subprocess([
-        sys.executable, os.path.join(pre_dir, "fix_audio_length_to_240000.py"),
+        sys.executable, os.path.join(pre_dir, "fix_audio_length.py"),
         "--input_dir", os.path.join(project_root, "data_source_unlabeled"),
         "--output_dir", os.path.join(project_root, "data_unlabeled")
     ])
@@ -93,9 +93,9 @@ def run_step3_student_model_train():
 # 테스트 단계로 넘어옴  
 @timed_step
 def run_step_4_preprocess_test_data():
-    """Test 원본 오디오를 고정된 길이로 전처리합니다."""
+    """Test 원본 오디오를 최소 길이 보장(패딩만, 자르지 않음)으로 전처리합니다."""
     return run_subprocess([
-        sys.executable, os.path.join(pre_dir, "fix_audio_length_to_240000.py"),
+        sys.executable, os.path.join(pre_dir, "fix_audio_length.py"),
         "--input_dir", os.path.join(project_root, "data_source_test"),
         "--output_dir", os.path.join(project_root, "data_test")
     ])

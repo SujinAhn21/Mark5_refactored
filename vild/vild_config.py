@@ -2,6 +2,7 @@
 # 뭐가 많아질수록 힘들구나.  
 # [12:41]
 
+import math
 import torch
 from sentence_transformers import SentenceTransformer
 import os
@@ -93,7 +94,13 @@ class AudioViLDConfig:
         self.segment_saliency_power = 1.0
         self.others_confidence_threshold = 0.45
         self.others_margin_threshold = 0.05
-        self.others_entropy_threshold = 0.82
+        # [삭제 2026-07-11] others_entropy_threshold 하드코딩(0.82) 제거, 아래 property로 대체.
+        # mark4_refactored에서 발견: 이 값이 클래스 수와 무관한 절대값으로 고정돼 있으면,
+        # 클래스 수가 다른 mark_version 사이에서 confidence_threshold와 어긋난 엄격도로 작동함
+        # (mark4.x 2-class에서 confusion matrix 완전 붕괴의 근본 원인이었음, 자세한 내용은
+        # mark4_refactored/vild/vild_config.py의 동일 property 주석 참조).
+        # mark5(9-class)는 기존 하드코딩값(0.82)이 우연히 confidence_threshold(0.45)와 거의
+        # 같은 엄격도(top_conf≈0.47 지점)였어서 이 변경으로도 동작이 거의 그대로 유지된다.
         self.class_pair_margin_overrides = {
             ("water_toilet", "water_shower"): 0.03,
             ("construction", "machine_noise"): 0.03,
@@ -173,6 +180,24 @@ class AudioViLDConfig:
         """
         # 평가용 클래스 목록을 사용하도록 변경
         return {class_name: i for i, class_name in enumerate(self.get_classes_for_evaluation())}
+
+    @property
+    def others_entropy_threshold(self) -> float:
+        """
+        [추가 2026-07-11] others_confidence_threshold와 "같은 엄격도(같은 top_conf 지점)"가
+        되도록 클래스 수 기반으로 자동 역산한다. top_conf=confidence_threshold이고 나머지
+        확률이 (클래스수-1)개에 균등분산되는 최악의 경우를 가정해 그때의 정규화 entropy를
+        threshold로 삼는다. 클래스 수가 다른 mark_version 사이에서 entropy 조건이
+        confidence 조건보다 부당하게 엄격/느슨해지는 것을 방지한다.
+        """
+        p = self.others_confidence_threshold
+        n = self.num_distinct_labeled_classes
+        if n <= 1:
+            return 1.0
+        rest = 1.0 - p
+        probs = [p] + [rest / (n - 1)] * (n - 1)
+        entropy = -sum(x * math.log(x, 2) for x in probs if x > 1e-12)
+        return entropy / math.log2(n)
 
     @property
     def num_input_channels(self) -> int:

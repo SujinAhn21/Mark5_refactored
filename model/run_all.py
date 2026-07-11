@@ -9,7 +9,7 @@ import sys
 
 # ===== 파라미터 설정 =====
 parser = argparse.ArgumentParser(description="mark5.0 전체 학습 파이프라인 (앙상블 지식 증류)")
-parser.add_argument("--mark_version", type=str, default="mark5.0", help="실행할 모델 버전")
+parser.add_argument("--mark_version", type=str, required=True, help="실행할 모델 버전")
 args = parser.parse_args()
 mark_version = args.mark_version
 

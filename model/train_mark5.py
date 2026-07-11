@@ -449,7 +449,7 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="mark5.0 Student 모델을 학습합니다.")
-    parser.add_argument("--mark_version", type=str, default="mark5.0")
+    parser.add_argument("--mark_version", type=str, required=True)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     train_mark5(seed_value=args.seed, mark_version=args.mark_version)

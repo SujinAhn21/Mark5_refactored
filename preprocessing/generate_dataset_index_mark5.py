@@ -149,7 +149,7 @@ def process_labeled_folder(data_dir, output_csv, plot_path, config):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="학습/테스트용 데이터 인덱스 파일을 생성합니다.")
-    parser.add_argument('--mark_version', type=str, default="mark5.0",
+    parser.add_argument('--mark_version', type=str, required=True,
                         help="설정을 불러올 모델 버전")
     parser.add_argument('--mode', type=str, required=True, choices=['train', 'test'],
                         help="'train' 또는 'test' 모드를 선택하세요.")
